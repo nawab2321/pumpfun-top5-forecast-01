@@ -12,7 +12,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 PLACES = 5
 SIMULATIONS = 1800
 MAX_CANDIDATES = 230
@@ -97,8 +96,6 @@ def build_candidates(marks: list[dict], cadence_minutes: int) -> tuple[list[dict
 
     last_index = len(marks) - 1
     latest = {row["mint"]: row for row in marks[-1]["rows"]}
-    # A short memory of formerly exceptional coins catches a temporary rank slip without
-    # allowing the large long-tail of vanished tokens to dominate the simulation.
     selected = set(latest)
     for mint, records in histories.items():
         best_rank = min(int(record[1]["rank"]) for record in records)
@@ -118,7 +115,7 @@ def build_candidates(marks: list[dict], cadence_minutes: int) -> tuple[list[dict
             gap = right[0] - left[0]
             if gap > 0:
                 changes.append((right[2] - left[2]) / gap)
-        recent = changes[-1] if changes else 0.0  # log10 cap change per mark
+        recent = changes[-1] if changes else 0.0
         medium = sum(changes[-3:]) / max(1, len(changes[-3:]))
         momentum = 0.65 * recent + 0.35 * medium
         try:
@@ -137,8 +134,7 @@ def build_candidates(marks: list[dict], cadence_minutes: int) -> tuple[list[dict
         })
 
     candidates.sort(key=lambda item: (item["rank"], -item["base"], item["mint"]))
-    candidates = candidates[:MAX_CANDIDATES]
-    return candidates, latest
+    return candidates[:MAX_CANDIDATES], latest
 
 
 def observed_recent_growth(marks: list[dict]) -> float:
@@ -166,20 +162,12 @@ def calibrate_candidate_coverage(marks: list[dict], cadence_minutes: int) -> lis
     return coverage
 
 
-def known_mass(
-    horizon_hours: float,
-    place: int,
-    coverage: list[dict[int, tuple[int, int]]],
-    cadence_minutes: int,
-) -> float:
-    # Candidate-address coverage is learned from earlier cut/target pairs in this
-    # same history. A prior steadies estimates when only a few long windows exist.
+def known_mass(horizon_hours: float, place: int, coverage: list[dict[int, tuple[int, int]]], cadence_minutes: int) -> float:
     horizon = max(0.0, horizon_hours)
     target_gap = horizon * 60.0 / cadence_minutes
     prior = bounded(KNOWN_PRIOR_START - KNOWN_PRIOR_FADE * min(horizon, 13.0), 0.30, 0.58)
     bandwidth = max(1.5, min(8.0, target_gap * 0.12))
-    weighted_yes = 0.0
-    weighted_total = 0.0
+    weighted_yes = weighted_total = 0.0
     for gap, (yes, total) in coverage[place - 1].items():
         z = (gap - target_gap) / bandwidth
         weight = math.exp(-0.5 * z * z)
@@ -189,13 +177,8 @@ def known_mass(
 
 
 def simulate_horizon(
-    candidates: list[dict],
-    marks: list[dict],
-    horizon_hours: float,
-    place_count: int,
-    edges: list[float],
-    seed: int,
-    coverage: list[dict[int, tuple[int, int]]],
+    candidates: list[dict], marks: list[dict], horizon_hours: float, place_count: int,
+    edges: list[float], seed: int, coverage: list[dict[int, tuple[int, int]]],
     cadence_minutes: int,
 ) -> tuple[list[dict[str, float]], list[list[float]], list[float]]:
     rng = random.Random(seed)
@@ -214,9 +197,6 @@ def simulate_horizon(
             mean = candidate["base"] + trend - age_drag - 0.025 * candidate["stale"] + common
             sigma_per_hour = 0.17 + 0.035 * min(candidate["age"], 5.0) + 0.06 * min(abs(candidate["momentum"]), 1.0)
             value = mean + rng.gauss(0.0, VOLATILITY_SCALE * sigma_per_hour * math.sqrt(horizon))
-
-            # Pump tokens have a heavy-tailed path: a modest fraction collapse while
-            # a smaller fraction make a large new run. The terms are seeded and local.
             crash_p = min(0.48, 1.0 - math.exp(-CRASH_HAZARD * horizon))
             if rng.random() < crash_p:
                 value -= 0.45 + rng.expovariate(1.9)
@@ -236,18 +216,10 @@ def simulate_horizon(
         mass = known_mass(horizon, place_index + 1, coverage, cadence_minutes)
         probabilities.append({
             candidates[i]["mint"]: mass * hist[place_index][i] / SIMULATIONS
-            for i in range(n)
-            if hist[place_index][i]
+            for i in range(n) if hist[place_index][i]
         })
 
-    known_sizes = [
-        [count / SIMULATIONS for count in size_hist[place_index]]
-        for place_index in range(place_count)
-    ]
-
-    # Unknown launches have no address at the cut. Model their cap sizes with a
-    # broad age/cohort distribution, centered on the current market's scale plus
-    # conservative growth over the remaining hours.
+    known_sizes = [[count / SIMULATIONS for count in size_hist[p]] for p in range(place_count)]
     last_rows = marks[-1]["rows"]
     proxy_growth = bounded(growth * 0.18, -0.04, 0.08)
     unknown_sizes = []
@@ -272,17 +244,11 @@ def simulate_horizon(
     return probabilities, mixed_sizes, expected_rank
 
 
-def select_probability_rows(
-    probabilities: dict[str, float],
-    max_rows: int = MAX_ROWS_PER_PLACE,
-) -> list[dict]:
+def select_probability_rows(probabilities: dict[str, float], max_rows: int = MAX_ROWS_PER_PLACE) -> list[dict]:
     ranked = sorted(probabilities.items(), key=lambda item: (-item[1], item[0]))
-    # Naming a coin with less mass than the residual equal share lowers its score
-    # under the wildcard model. Stop when the next row would be below that share.
     selected: list[tuple[str, float]] = []
     total = 0.0
     for mint, p in ranked[:max_rows]:
-        remaining_slots = max_rows - len(selected)
         residual_share = max(0.0, 1.0 - total) / max(1, 100 - len(selected))
         if p <= residual_share:
             break
@@ -324,8 +290,7 @@ def forecast(task: dict, marks: list[dict]) -> dict:
 
     probability_rows = []
     for place_index in range(places):
-        rows = select_probability_rows(dict(probability_totals[place_index]))
-        for row in rows:
+        for row in select_probability_rows(dict(probability_totals[place_index])):
             probability_rows.append({"mint": row["mint"], "place": place_index + 1, "p": row["p"]})
 
     top5 = sorted(candidates, key=lambda c: (-expected_rank[c["mint"]], c["rank"], c["mint"]))[:places]
@@ -338,10 +303,8 @@ def forecast(task: dict, marks: list[dict]) -> dict:
     for place_index in range(places):
         probs = [max(0.0, p) for p in size_totals[place_index]]
         total = sum(probs)
-        if total <= 0.0:
-            probs = [1.0 / len(probs)] * len(probs)
-        else:
-            probs = [p / total for p in probs]
+        probs = ([1.0 / len(probs)] * len(probs) if total <= 0.0
+                 else [p / total for p in probs])
         probs = [round(p, 9) for p in probs]
         probs[-1] = max(0.0, round(1.0 - sum(probs[:-1]), 9))
         for bin_index, p in enumerate(probs):
@@ -354,12 +317,46 @@ def main() -> None:
     input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
     output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
     task, marks = load_history(input_dir)
+    validate_inputs(task, marks)
     result = forecast(task, marks)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / task.get("output", "forecast.json")).write_text(
         json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+
+
+
+
+
+def validate_inputs(task: dict, marks: list[dict]) -> None:
+    """Reject malformed histories before they can produce a plausible-looking forecast."""
+    size = task.get("size")
+    edges = size.get("edges") if isinstance(size, dict) else None
+    if not isinstance(edges, list) or not edges:
+        raise ValueError("task.size.edges must be a non-empty list")
+    if any(not isinstance(edge, (int, float)) or not math.isfinite(edge) for edge in edges):
+        raise ValueError("size edges must be finite numbers")
+    if edges != sorted(set(edges)):
+        raise ValueError("size edges must be strictly increasing")
+    if not marks:
+        raise ValueError("history has no usable marks")
+    previous_at = None
+    for mark in marks:
+        if previous_at is not None and mark["at"] <= previous_at:
+            raise ValueError("history marks must be strictly chronological")
+        previous_at = mark["at"]
+        seen = set()
+        for row in mark["rows"]:
+            mint = row.get("mint")
+            if not isinstance(mint, str) or not mint:
+                raise ValueError("history row has no mint")
+            if mint in seen:
+                raise ValueError("history mark contains a duplicate mint")
+            seen.add(mint)
+            if int(row["market_cap_lamports"]) <= 0:
+                raise ValueError("market cap must be positive")
 
 
 if __name__ == "__main__":
