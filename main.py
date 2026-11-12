@@ -319,6 +319,7 @@ def main() -> None:
     task, marks = load_history(input_dir)
     validate_inputs(task, marks)
     result = forecast(task, marks)
+    validate_forecast_output(result, int(task.get("places", PLACES)), len(task["size"]["edges"]) + 1)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / task.get("output", "forecast.json")).write_text(
         json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n",
@@ -357,6 +358,110 @@ def validate_inputs(task: dict, marks: list[dict]) -> None:
             seen.add(mint)
             if int(row["market_cap_lamports"]) <= 0:
                 raise ValueError("market cap must be positive")
+
+
+
+
+def _require(condition: bool, message: str) -> None:
+    """Raise a clear error instead of writing a structurally invalid answer."""
+    if not condition:
+        raise ValueError(message)
+
+
+def _probability(value: object, label: str) -> float:
+    """Parse one finite probability and enforce the closed unit interval."""
+    _require(isinstance(value, (int, float)), f"{label} must be numeric")
+    result = float(value)
+    _require(math.isfinite(result), f"{label} must be finite")
+    _require(0.0 <= result <= 1.0, f"{label} must be between zero and one")
+    return result
+
+
+def validate_forecast_output(result: dict, places: int, bin_count: int) -> None:
+    """Check every protocol invariant before serializing the forecast."""
+    _require(isinstance(result, dict), "forecast must be a JSON object")
+    _require(set(result) == {"probabilities", "top5", "sizes"}, "forecast keys do not match protocol")
+    _require(isinstance(places, int) and places > 0, "place count must be positive")
+    _require(isinstance(bin_count, int) and bin_count > 0, "size-bin count must be positive")
+
+    top5 = result["top5"]
+    _require(isinstance(top5, list), "top5 must be a list")
+    _require(len(top5) == places, "top5 must contain one mint per place")
+    _require(all(isinstance(mint, str) and mint for mint in top5), "top5 contains an invalid mint")
+    _require(len(set(top5)) == places, "top5 contains duplicate mints")
+
+    probability_rows = result["probabilities"]
+    _require(isinstance(probability_rows, list), "probabilities must be a list")
+    seen_probability_rows = set()
+    probability_mass = [0.0] * places
+    row_counts = [0] * places
+    for row in probability_rows:
+        _require(isinstance(row, dict), "probability row must be an object")
+        _require(set(row) == {"mint", "place", "p"}, "probability row keys do not match protocol")
+        mint = row["mint"]
+        place = row["place"]
+        _require(isinstance(mint, str) and mint, "probability row has an invalid mint")
+        _require(isinstance(place, int) and not isinstance(place, bool), "probability place must be an integer")
+        _require(1 <= place <= places, "probability place is outside the requested range")
+        key = (mint, place)
+        _require(key not in seen_probability_rows, "duplicate mint and place probability")
+        seen_probability_rows.add(key)
+        value = _probability(row["p"], "coin probability")
+        _require(value > 0.0, "zero-probability rows must be omitted")
+        probability_mass[place - 1] += value
+        row_counts[place - 1] += 1
+
+    validate_probability_order(probability_rows, places)
+
+    for place_index in range(places):
+        _require(row_counts[place_index] <= MAX_ROWS_PER_PLACE, "too many coin rows for a place")
+        _require(probability_mass[place_index] <= 1.0 + 1e-7, "coin probability mass exceeds one")
+
+    size_rows = result["sizes"]
+    _require(isinstance(size_rows, list), "sizes must be a list")
+    _require(len(size_rows) == places * bin_count, "sizes must contain every place and bin")
+    seen_size_rows = set()
+    size_mass = [0.0] * places
+    for row in size_rows:
+        _require(isinstance(row, dict), "size row must be an object")
+        _require(set(row) == {"place", "bin", "p"}, "size row keys do not match protocol")
+        place = row["place"]
+        bin_index = row["bin"]
+        _require(isinstance(place, int) and not isinstance(place, bool), "size place must be an integer")
+        _require(isinstance(bin_index, int) and not isinstance(bin_index, bool), "size bin must be an integer")
+        _require(1 <= place <= places, "size place is outside the requested range")
+        _require(0 <= bin_index < bin_count, "size bin is outside the configured edges")
+        key = (place, bin_index)
+        _require(key not in seen_size_rows, "duplicate place and size bin")
+        seen_size_rows.add(key)
+        size_mass[place - 1] += _probability(row["p"], "size-bin probability")
+
+    for place_index, mass in enumerate(size_mass, start=1):
+        _require(abs(mass - 1.0) <= 1e-6, f"size-bin probabilities for place {place_index} do not sum to one")
+
+
+
+
+def validate_probability_order(rows: list[dict], places: int) -> None:
+    """Require stable place grouping and descending-probability row order."""
+    last_place = 0
+    last_probability = 2.0
+    last_mint = ""
+    for row in rows:
+        place = row["place"]
+        probability = float(row["p"])
+        mint = row["mint"]
+        _require(place >= last_place, "probability rows must be grouped by place")
+        if place != last_place:
+            last_probability = 2.0
+            last_mint = ""
+        _require(probability <= last_probability + 1e-12, "probability rows must be sorted from largest to smallest")
+        if abs(probability - last_probability) <= 1e-12 and last_mint:
+            _require(mint >= last_mint, "equal-probability rows must use mint order")
+        last_place = place
+        last_probability = probability
+        last_mint = mint
+    _require(last_place <= places, "probability rows contain an unknown place")
 
 
 if __name__ == "__main__":
